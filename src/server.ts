@@ -10,17 +10,19 @@ import {
   type StreamTextOnFinishCallback,
   type ToolSet,
 } from "ai";
-import { openai } from "@ai-sdk/openai";
+import { createWorkersAI } from "workers-ai-provider";
 import { processToolCalls } from "./utils";
 import { tools, executions } from "./tools";
-// import { env } from "cloudflare:workers";
+import { env } from "cloudflare:workers";
+import { handleLabelingRequest } from "./api/labelingApi";
 
-const model = openai("gpt-4o-2024-11-20");
-// Cloudflare AI Gateway
-// const openai = createOpenAI({
-//   apiKey: env.OPENAI_API_KEY,
-//   baseURL: env.GATEWAY_BASE_URL,
-// });
+const workersai = createWorkersAI({ binding: env.AI });
+const model = workersai("@cf/meta/llama-3.1-8b-instruct", {
+  // additional settings
+  safePrompt: true,
+});
+
+// Workers AI model is configured above
 
 /**
  * Chat Agent implementation that handles real-time AI chat interactions
@@ -57,7 +59,7 @@ export class Chat extends AIChatAgent<Env> {
           executions,
         });
 
-        // Stream the AI response using GPT-4
+        // Stream the AI response using Workers AI Llama model
         const result = streamText({
           model,
           system: `You are a helpful assistant that can do various tasks... 
@@ -107,21 +109,73 @@ export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
     const url = new URL(request.url);
 
-    if (url.pathname === "/check-open-ai-key") {
-      const hasOpenAIKey = !!process.env.OPENAI_API_KEY;
-      return Response.json({
-        success: hasOpenAIKey,
-      });
+    // Handle data labeling API requests
+    if (url.pathname === "/api/label") {
+      return handleLabelingRequest(request, env);
     }
-    if (!process.env.OPENAI_API_KEY) {
-      console.error(
-        "OPENAI_API_KEY is not set, don't forget to set it locally in .dev.vars, and use `wrangler secret bulk .dev.vars` to upload it to production"
-      );
+
+    // Simple completion endpoint for generating reasoning
+    if (url.pathname === "/api/completion") {
+      try {
+        const body = await request.json();
+        const { prompt, max_tokens = 500 } = body;
+
+        if (!prompt) {
+          return Response.json({ error: "Missing prompt" }, { status: 400 });
+        }
+
+        // Call Workers AI for a completion
+        const response = await env.AI.run(
+          "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+          {
+            messages: [
+              {
+                role: "user",
+                content: prompt,
+              },
+            ],
+            max_tokens: max_tokens,
+          }
+        );
+
+        return Response.json({
+          completion:
+            response.response ||
+            response.result?.response ||
+            response.result?.content ||
+            "",
+        });
+      } catch (error) {
+        console.error("Error in completion API:", error);
+        return Response.json(
+          {
+            error: "Failed to generate completion",
+            message: error instanceof Error ? error.message : "Unknown error",
+          },
+          { status: 500 }
+        );
+      }
     }
-    return (
-      // Route the request to our agent or return 404 if not found
-      (await routeAgentRequest(request, env)) ||
-      new Response("Not found", { status: 404 })
-    );
+
+    // Handle API requests through agent routing
+    const agentResponse = await routeAgentRequest(request, env);
+    if (agentResponse) {
+      return agentResponse;
+    }
+
+    // For all other routes, serve the index.html to support client-side routing
+    // This enables routes like /data-labeler to work with React Router
+    try {
+      // Try to serve static assets first
+      const assetResponse = await env.ASSETS.fetch(request.url);
+      if (assetResponse.status !== 404) {
+        return assetResponse;
+      }
+
+      // If not a static asset, serve index.html for client-side routing
+      return await env.ASSETS.fetch(`${url.origin}/index.html`);
+    } catch (e) {
+      return new Response("Not found", { status: 404 });
+    }
   },
 } satisfies ExportedHandler<Env>;

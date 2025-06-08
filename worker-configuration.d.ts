@@ -5,6 +5,8 @@ declare namespace Cloudflare {
 	interface Env {
 		OPENAI_API_KEY: string;
 		Chat: DurableObjectNamespace<import("./src/server").Chat>;
+		AI: any; // Workers AI binding
+		ASSETS: { fetch: typeof fetch }; // Static assets binding
 	}
 }
 interface Env extends Cloudflare.Env {}
